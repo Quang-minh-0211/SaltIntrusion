@@ -3,7 +3,7 @@ import torch.nn as nn
 
 hidden_size = 64
 num_layers = 2
-cnn_filters = 64
+cnn_filters = 128
 kernel_size = 3
 
 class RNNModel(nn.Module):
@@ -79,20 +79,28 @@ def build_model(
     input_size: int,
     horizon: int,
     hidden_size: int = hidden_size,
-    num_layers: int = num_layers
+    num_layers: int = num_layers,
+    cnn_filters: int = cnn_filters,
+    kernel_size: int = kernel_size,
 ) -> nn.Module:
     kwargs = dict(
-        input_size = input_size,
+        input_size  = input_size,
         hidden_size = hidden_size,
-        num_layers = num_layers,
-        horizon = horizon,
+        num_layers  = num_layers,
+        horizon     = horizon,
     )
     models = {
-        "RNN": RNNModel,
-        "LSTM": LSTMModel,
-        "GRU": GRUModel,
+        "RNN":      RNNModel,
+        "LSTM":     LSTMModel,
+        "GRU":      GRUModel,
         "CNN_LSTM": CNNLSTMModel,
     }
     if model_name not in models:
         raise ValueError(f"Model name not available: '{model_name}'.")
+    
+    # Chỉ truyền cnn_filters và kernel_size cho CNN_LSTM
+    if model_name == "CNN_LSTM":
+        kwargs["cnn_filters"] = cnn_filters
+        kwargs["kernel_size"] = kernel_size
+
     return models[model_name](**kwargs)
