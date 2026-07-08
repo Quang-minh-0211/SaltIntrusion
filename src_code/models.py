@@ -74,6 +74,38 @@ class CNNLSTMModel(nn.Module):
         out, _ = self.lstm(x)
         return self.fc(out[:, -1, :])
     
+class parallelCNNLSTMModel(nn.Module):
+    def __init__(self, input_size, hidden_size, num_layers, horizon, cnn_filters=32, kernel_size=3, dropout=0.2):
+        super().__init__()
+
+        self.lstm = nn.LSTM(
+            input_size, hidden_size, num_layers, batch_first=True, dropout=dropout if num_layers > 1 else 0.0,
+        )
+        self.conv = nn.Conv1d(
+            in_channels=input_size,
+            out_channels=cnn_filters,
+            kernel_size=kernel_size,
+            padding=kernel_size//2,
+        )
+        self.relu = nn.ReLU()
+        self.cnn_pooling = nn.AdaptiveAvgPool1d(1)
+
+        self.dropout = nn.Dropout(dropout)
+
+        self.fc = nn.Linear(hidden_size+cnn_filters, horizon)
+    def forward(self,x):
+        lstm_out, _ = self.lstm(x)
+        lstm_feat = lstm_out[:, -1, :]
+
+        c = x.permute(0,2,1)
+        c = self.relu(self.conv(c))
+        c = self.cnn_pooling(c)
+        cnn_feat = c.squeeze(-1)
+
+        combined = torch.cat([lstm_feat, cnn_feat], dim=1)
+        combined = self.dropout(combined)
+        return self.fc(combined)
+                      
 def build_model(
     model_name: str,
     input_size: int,
@@ -94,12 +126,13 @@ def build_model(
         "LSTM":     LSTMModel,
         "GRU":      GRUModel,
         "CNN_LSTM": CNNLSTMModel,
+        "PARALLEL_CNN_LSTM": parallelCNNLSTMModel,
     }
     if model_name not in models:
         raise ValueError(f"Model name not available: '{model_name}'.")
     
     # Chỉ truyền cnn_filters và kernel_size cho CNN_LSTM
-    if model_name == "CNN_LSTM":
+    if model_name in ("CNN_LSTM","PARALLEL_CNN_LSTM","PARALLEL_CNN_LSTM_ATTEN"):
         kwargs["cnn_filters"] = cnn_filters
         kwargs["kernel_size"] = kernel_size
 
