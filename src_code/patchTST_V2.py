@@ -1,158 +1,296 @@
 # ============================================================
-# patchtst_station.py — PatchTST + tầng attention giữa các trạm đo mặn
+# patchtst.py — PatchTST chuẩn cho bài toán dự báo xâm nhập mặn
+# Tương thích pipeline hiện có: forward(x) -> (B, horizon)
+#   x: (batch, lookback, n_features)  — giống LSTM/GRU của bạn
 #
-# Cải tiến (bước 3 của lộ trình): PatchTST gốc xử lý các kênh hoàn toàn
-# độc lập nên không biểu diễn được quan hệ thượng-hạ lưu giữa các trạm —
-# vốn là vật lý thật của xâm nhập mặn (mặn ở Cầu Nổi hôm nay sẽ xuất
-# hiện ở Bến Lức sau vài con nước). Module này thêm MỘT tầng attention
-# nhỏ CHỈ giữa các kênh độ mặn (mặc định 3 kênh đầu), chèn giữa
-# bước 5 (encoder) và bước 6 (head):
+# Thành phần đúng theo bài gốc (Nie et al., ICLR 2023):
+#   1. RevIN            — chuẩn hóa từng cửa sổ, từng kênh (chống lệch mùa)
+#   2. Channel independence — (B, L, M) -> (B*M, L)
+#   3. Patching         — cắt chuỗi thành patch (mặc định 6 bước = 12h ≈ 1 con nước)
+#   4. Linear embedding + learnable positional encoding
+#   5. Transformer encoder (pre-norm, GELU)
+#   6. Flatten head     — (n_patches * d_model) -> horizon, dùng chung mọi kênh
+#   7. Lấy kênh target + RevIN denorm
 #
-#   ... -> encoder -> (B*M, N, D)
-#            -> reshape (B, M, N, D)
-#            -> tách các kênh mặn: (B, 3, N, D)
-#            -> với MỖI vị trí patch n: attention giữa 3 trạm
-#               x_sal = x_sal + tanh(alpha) * MHA(x_sal)   # alpha init = 0
-#            -> ghép lại -> head như cũ
+# CẢI TIẾN (tùy chọn, use_future=True): nhánh hiệp biến tương lai —
+# 6 đặc trưng chu kỳ (hour/lunar/year sin-cos) là TẤT ĐỊNH nên biết
+# trước được cho mọi bước tương lai; nhánh này tiêm pha triều tương lai
+# vào dự báo, zero-init để tại init tương đương baseline.
 #
-# Cổng tanh(alpha) khởi tạo 0 => tại init mô hình TƯƠNG ĐƯƠNG PatchTST
-# gốc (không thể khởi đầu tệ hơn baseline). Giá trị alpha học được là
-# bằng chứng định lượng mô hình khai thác liên kết trạm đến đâu.
+# LƯU Ý TÍCH HỢP: cần truyền context_len = lookback khi khởi tạo
+# (xem hướng dẫn ở cuối file).
 # ============================================================
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
-from patchTST import PatchTST
 
+class RevIN(nn.Module):
+    """Reversible Instance Normalization (Kim et al., 2022).
 
-class StationAttention(nn.Module):
-    """Attention giữa các trạm tại từng vị trí patch (time-aligned).
-
-    Đầu vào  : (B, S, N, D)  — S = số kênh mặn (3 trạm)
-    Đầu ra   : (B, S, N, D)  — đã trao đổi thông tin giữa trạm
-    Attention map (B*N, S, S) được lưu ở self.last_attn để vẽ hình
-    interpretability (trạm nào ảnh hưởng trạm nào).
+    Chuẩn hóa mỗi kênh của MỖI cửa sổ về mean 0, std 1 (tính trên trục thời
+    gian), rồi trả ngược thống kê đó vào dự báo ở đầu ra. Giúp mô hình không
+    bị lệch khi mức mặn nền thay đổi giữa các mùa (vd 2020 hạn nặng vs 2022).
     """
 
-    def __init__(self, d_model: int, n_heads: int = 4, dropout: float = 0.1):
+    def __init__(self, num_channels: int, eps: float = 1e-5, affine: bool = True):
         super().__init__()
-        self.norm = nn.LayerNorm(d_model)
-        self.attn = nn.MultiheadAttention(d_model, n_heads,
-                                          dropout=dropout, batch_first=True)
-        self.alpha = nn.Parameter(torch.zeros(1))   # cổng zero-init (ReZero)
-        self.station_emb = nn.Parameter(torch.randn(3, 1, d_model) * 0.02)
-        self.last_attn = None
+        self.eps = eps
+        self.affine = affine
+        if affine:
+            self.gamma = nn.Parameter(torch.ones(num_channels))
+            self.beta = nn.Parameter(torch.zeros(num_channels))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, S, N, D = x.shape
-        # Trải phẳng trạm x thời gian thành MỘT câu dài S*N token:
-        # mỗi token mặn giờ nhìn được TOÀN BỘ token của mọi trạm, mọi con nước
-        h = x.reshape(B, S * N, D)
-        # Danh tính trạm chỉ cộng vào nhánh attention (không vào residual)
-        # để giữ tính tương đương với PatchTST gốc khi alpha = 0
-        h_in = self.norm((x + self.station_emb[:S]).reshape(B, S * N, D))
-        out, attn_w = self.attn(h_in, h_in, h_in,
-                                need_weights=True, average_attn_weights=True)
-        self.last_attn = attn_w.detach()            # (B, S*N, S*N)
-        h = h + torch.tanh(self.alpha) * out
-        return h.reshape(B, S, N, D)
+    def normalize(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, L, M)
+        self.mean = x.mean(dim=1, keepdim=True).detach()          # (B, 1, M)
+        self.std = torch.sqrt(
+            x.var(dim=1, keepdim=True, unbiased=False) + self.eps
+        ).detach()                                                 # (B, 1, M)
+        x = (x - self.mean) / self.std
+        if self.affine:
+            x = x * self.gamma + self.beta
+        return x
+
+    def denormalize_target(self, y: torch.Tensor, target_idx: int) -> torch.Tensor:
+        # y: (B, horizon) — dự báo của kênh target (đang ở không gian RevIN)
+        if self.affine:
+            y = (y - self.beta[target_idx]) / (self.gamma[target_idx] + self.eps)
+        return y * self.std[:, 0, target_idx: target_idx + 1] \
+                 + self.mean[:, 0, target_idx: target_idx + 1]
 
 
-class PatchTSTStation(PatchTST):
-    """PatchTST + StationAttention giữa bước 5 và bước 6.
+class PatchTST_V2(nn.Module):
+    """PatchTST (supervised, chế độ dự báo — "7 bước").
 
-    Tham số thêm
-    ------------
-    n_salinity   : số kênh đầu tiên là kênh độ mặn (SC3: 3, thứ tự
-                   BenLuc, CauNoi, TanAn — khớp feature_cols của bạn)
-    station_heads: số head của tầng attention trạm (nhỏ thôi, 4 là đủ)
+    Parameters
+    ----------
+    input_size  : số kênh đầu vào M (với Scenario 3 của bạn là 12)
+    context_len : lookback L tính theo số bước (PHẢI truyền, vd 24 = 48h)
+    horizon     : số bước dự báo H
+    d_model     : chiều embedding (tương đương "hidden_size")
+    n_layers    : số layer encoder
+    n_heads     : số attention head (d_model phải chia hết cho n_heads)
+    patch_len   : độ dài patch theo bước. Mặc định 6 bước = 12h ≈ 1 chu kỳ
+                  bán nhật triều — mỗi token là một "con nước".
+    stride      : bước trượt giữa các patch. stride = patch_len -> không
+                  chồng lấn (chuẩn cho masked pretraining sau này).
+    target_idx  : vị trí kênh target trong feature_cols
+                  (Scenario 3: Salinity_BenLuc = cột 0)
+    revin       : bật/tắt RevIN
+    use_future  : bật nhánh hiệp biến tương lai. Khi True, forward nhận
+                  thêm x_future: (B, horizon, 6) — 6 đặc trưng chu kỳ
+                  tại các bước TƯƠNG LAI (biết trước vì tất định).
+    n_future    : số đặc trưng tương lai (mặc định 6, nằm ở 6 CỘT CUỐI
+                  của feature_cols: hour/lunar/year sin-cos)
     """
 
-    def __init__(self, *args, n_salinity: int = 3, station_heads: int = 4,
-                 station_dropout: float = 0.1, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.n_salinity = n_salinity
-        # d_model suy ra từ lớp embed của lớp cha
-        d_model = self.embed.out_features
-        self.station_attn = StationAttention(d_model, station_heads,
-                                             station_dropout)
+    def __init__(self, input_size: int, context_len: int, horizon: int,
+                 d_model: int = 128, n_layers: int = 3, n_heads: int = 8,
+                 patch_len: int = 6, stride: int = 6, d_ff: int = 256,
+                 dropout: float = 0.2, head_dropout: float = 0.1,
+                 target_idx: int = 0, revin: bool = True,
+                 use_future: bool = False, n_future: int = 6):
+        super().__init__()
+        if context_len < patch_len:
+            raise ValueError(
+                f"context_len ({context_len}) phải >= patch_len ({patch_len}). "
+                f"Với lookback ngắn, hãy giảm patch_len (vd patch_len=3)."
+            )
+        if d_model % n_heads != 0:
+            raise ValueError(f"d_model ({d_model}) phải chia hết cho n_heads ({n_heads}).")
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        self.input_size = input_size
+        self.context_len = context_len
+        self.horizon = horizon
+        self.patch_len = patch_len
+        self.stride = stride
+        self.target_idx = target_idx
+
+        # Số patch; nếu (L - P) không chia hết cho stride thì pad cuối chuỗi
+        # bằng cách lặp giá trị cuối (replication) để phủ hết dữ liệu.
+        leftover = (context_len - patch_len) % stride
+        self.pad_len = 0 if leftover == 0 else stride - leftover
+        self.n_patches = (context_len + self.pad_len - patch_len) // stride + 1
+
+        self.revin = RevIN(input_size) if revin else None
+
+        # (3) -> (4): chiếu patch P chiều lên d_model + positional encoding học được
+        self.embed = nn.Linear(patch_len, d_model)
+        self.pos = nn.Parameter(torch.randn(1, self.n_patches, d_model) * 0.02)
+        self.embed_dropout = nn.Dropout(dropout)
+
+        # (5): Transformer encoder — pre-norm + GELU cho ổn định trên dữ liệu nhỏ
+        layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=n_heads, dim_feedforward=d_ff,
+            dropout=dropout, activation="gelu",
+            batch_first=True, norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(layer, num_layers=n_layers)
+        self.encoder_norm = nn.LayerNorm(d_model)
+
+        # (6): flatten head — dùng chung cho mọi kênh (channel independence)
+        self.head = nn.Sequential(
+            nn.Flatten(start_dim=-2),                      # (.., N, D) -> (.., N*D)
+            nn.Dropout(head_dropout),
+            nn.Linear(self.n_patches * d_model, horizon),
+        )
+
+        # (6.5) Nhánh hiệp biến tương lai (zero-init => init = baseline).
+        # Học một hiệu chỉnh điều hòa theo pha triều tương lai, cộng vào
+        # dự báo TRƯỚC khi RevIN denorm (hiệu chỉnh trong không gian chuẩn hóa).
+        self.use_future = use_future
+        self.n_future = n_future
+        if use_future:
+            self.future_head = nn.Linear(horizon * n_future, horizon)
+            nn.init.zeros_(self.future_head.weight)
+            nn.init.zeros_(self.future_head.bias)
+
+        # Để train_model của bạn không phải sửa (giống UDF_LSTM)
+        self.aux_loss = None
+
+    # --------------------------------------------------------
+    def _patchify(self, x: torch.Tensor) -> torch.Tensor:
+        """(B*M, L) -> (B*M, n_patches, patch_len)"""
+        if self.pad_len > 0:
+            x = F.pad(x.unsqueeze(1), (0, self.pad_len), mode="replicate").squeeze(1)
+        return x.unfold(dimension=-1, size=self.patch_len, step=self.stride)
+
+    def forward(self, x: torch.Tensor,
+                x_future: torch.Tensor = None) -> torch.Tensor:
+        # x: (B, L, M) ; x_future: (B, horizon, n_future) hoặc None
         B, L, M = x.shape
-        assert L == self.context_len
+        assert L == self.context_len, (
+            f"Model được build với context_len={self.context_len} "
+            f"nhưng nhận đầu vào L={L}. Truyền đúng lookback khi khởi tạo."
+        )
 
-        if self.revin is not None:                       # (0) RevIN
+        # (0) RevIN normalize
+        if self.revin is not None:
             x = self.revin.normalize(x)
 
-        x = x.permute(0, 2, 1).reshape(B * M, L)         # (2) tách kênh
-        x = self._patchify(x)                            # (3) cắt patch
-        x = self.embed_dropout(self.embed(x) + self.pos) # (4) embedding
-        x = self.encoder_norm(self.encoder(x))           # (5) encoder
+        # (2) Channel independence: (B, L, M) -> (B*M, L)
+        x = x.permute(0, 2, 1).reshape(B * M, L)
 
-        # ---- (5.5) TẦNG MỚI: attention giữa các trạm mặn ----
-        x = x.view(B, M, self.n_patches, -1)             # (B, M, N, D)
-        x_sal = self.station_attn(x[:, :self.n_salinity])
-        x = torch.cat([x_sal, x[:, self.n_salinity:]], dim=1)
-        x = x.reshape(B * M, self.n_patches, -1)
-        # ------------------------------------------------------
+        # (3) Patching: (B*M, N, P)
+        x = self._patchify(x)
 
-        y = self.head(x).view(B, M, self.horizon)        # (6) head
-        y = y[:, self.target_idx, :]                     # (7) target
+        # (4) Embedding + vị trí: (B*M, N, D)
+        x = self.embed_dropout(self.embed(x) + self.pos)
+
+        # (5) Encoder: (B*M, N, D)
+        x = self.encoder_norm(self.encoder(x))
+
+        # (6) Head: (B*M, N, D) -> (B*M, H) -> (B, M, H)
+        y = self.head(x).view(B, M, self.horizon)
+
+        # (7) Lấy kênh target
+        y = y[:, self.target_idx, :]                       # (B, H)
+
+        # (6.5) Cộng hiệu chỉnh từ pha triều tương lai (nếu bật)
+        if self.use_future and x_future is not None:
+            y = y + self.future_head(x_future.reshape(x_future.size(0), -1))
+
+        # (7b) Denorm
         if self.revin is not None:
             y = self.revin.denormalize_target(y, self.target_idx)
         return y
 
 
 # ============================================================
-# TÍCH HỢP: trong run_experiment thêm một nhánh nữa
+# HƯỚNG DẪN TÍCH HỢP VÀO NOTEBOOK
+# ============================================================
+# (1) Trong run_experiment, PatchTST cần biết lookback nên build trực tiếp
+#     thay vì qua build_model:
 #
-#   from patchtst_station import PatchTSTStation
-#   ...
-#   elif model_name == "PATCHTST_STATION":
-#       model = PatchTSTStation(
-#           input_size  = ds["train"][0].shape[2],
-#           context_len = lookback,
-#           horizon     = horizon,
-#           d_model     = p["hidden_size"],
-#           n_layers    = p["num_layers"],
-#           patch_len   = p.get("patch_len", 6),
-#           stride      = p.get("stride", 6),
-#           target_idx  = 0,
-#           n_salinity  = 3,
-#       )
+#     from patchtst import PatchTST
+#     ...
+#     if model_name == "PATCHTST":
+#         model = PatchTST(
+#             input_size  = ds["train"][0].shape[2],
+#             context_len = lookback,
+#             horizon     = horizon,
+#             d_model     = p["hidden_size"],
+#             n_layers    = p["num_layers"],
+#             patch_len   = p.get("patch_len", 6),
+#             stride      = p.get("stride", 6),
+#             target_idx  = 0,          # Salinity_BenLuc là cột 0 trong SC3
+#             use_future  = p.get("use_future", False),
+#         )
+#     else:
+#         model = build_model(model_name, ds["train"][0].shape[2], horizon,
+#                             hidden_size=p["hidden_size"],
+#                             num_layers=p["num_layers"], **extra)
 #
-#   BEST_PARAMS["PATCHTST_STATION"] = dict(BEST_PARAMS["PATCHTST"])
+# (2) Siêu tham số (LƯU Ý: Transformer cần learning rate THẤP hơn LSTM):
 #
-# Sau khi train, đọc mức độ sử dụng liên kết trạm:
-#   float(torch.tanh(model.station_attn.alpha))   # ~0 = không dùng
-# và attention map trung bình (3x3) để vẽ hình cho bài báo:
-#   model.station_attn.last_attn.mean(dim=0)
+#     BEST_PARAMS["PATCHTST"] = {
+#         "hidden_size":   128,     # d_model
+#         "num_layers":    3,
+#         "learning_rate": 1e-4,    # KHÔNG dùng 1e-3 — dễ phân kỳ
+#         "batch_size":    32,
+#         "patch_len":     6,       # 12h ~ 1 con nước
+#         "stride":        6,
+#         "use_future":    True,    # bật nhánh hiệp biến tương lai
+#     }
+#
+#     rồi thêm "PATCHTST" vào MODEL_NAMES.
+#
+# (3) Khi use_future=True, pipeline notebook phải cắt thêm mảng tương lai
+#     (B, horizon, 6) từ 6 CỘT CUỐI của feature_cols — 5 chỗ sửa:
+#     make_windows trả thêm Fs; make_windows_gapaware gom thêm Fa;
+#     build_dataset trả bộ ba (X, y, F); SalinityDataset nhận 3 mảng;
+#     train_model/evaluate unpack 3 tensor và gọi:
+#         out = model(Xb, Fb) if getattr(model, "use_future", False) else model(Xb)
+#     (chi tiết từng đoạn đã gửi ở tin nhắn trước — RNN/LSTM/GRU không có
+#     use_future nên tự đi nhánh cũ, baseline không bị ảnh hưởng.)
+#
+# (4) Khuyến nghị lookback: với patch_len=6, lookback=6 chỉ tạo 1 token
+#     (attention vô nghĩa), lookback=12 tạo 2 token. PatchTST phát huy sức
+#     mạnh với lookback dài: nên thêm 84 (168h = 14 token) vào LOOKBACKS,
+#     hoặc dùng patch_len=3 cho các lookback ngắn.
+#
+# (5) Đọc mức độ sử dụng nhánh tương lai sau khi train:
+#         model.future_head.weight.norm()    # ~0 = mô hình không dùng
 # ============================================================
 
 
 if __name__ == "__main__":
-    import torch.nn.functional as F
+    # Sanity test nhanh: chạy `python patchtst.py`
     torch.manual_seed(0)
 
-    # Test 1: forward/backward các cấu hình
-    for lb, hz in [(24, 12), (84, 24)]:
-        m = PatchTSTStation(input_size=12, context_len=lb, horizon=hz)
+    print("— Test 1: chế độ thường (không future) —")
+    for lb, hz, pl in [(24, 12, 6), (12, 6, 6), (6, 6, 3), (84, 24, 6)]:
+        m = PatchTST_V2(input_size=12, context_len=lb, horizon=hz, patch_len=pl)
         x = torch.randn(4, lb, 12)
         y = m(x)
         F.mse_loss(y, torch.randn(4, hz)).backward()
-        print(f"lookback={lb} horizon={hz} -> out {tuple(y.shape)} | backward OK")
+        print(f"  lookback={lb:3d} horizon={hz:3d} patch={pl} "
+              f"-> out {tuple(y.shape)} | n_patches={m.n_patches} | backward OK")
 
-    # Test 2 (quan trọng): tại init (alpha=0), đầu ra PHẢI trùng khớp
-    # với PatchTST gốc cùng trọng số => cải tiến khởi đầu từ đúng baseline
+    print("— Test 2: use_future=True, forward + backward —")
+    m = PatchTST_V2(input_size=12, context_len=24, horizon=12, use_future=True)
+    x, xf = torch.randn(4, 24, 12), torch.randn(4, 12, 6)
+    y = m(x, xf)
+    F.mse_loss(y, torch.randn(4, 12)).backward()
+    g = m.future_head.weight.grad.abs().sum().item()
+    print(f"  out {tuple(y.shape)} | grad future_head = {g:.4f} (phải > 0) | OK")
+
+    print("— Test 3: zero-init => use_future=True tại init trùng baseline —")
     torch.manual_seed(1)
-    base = PatchTST(input_size=12, context_len=24, horizon=12)
+    base = PatchTST_V2(input_size=12, context_len=24, horizon=12, use_future=False)
     torch.manual_seed(1)
-    ext = PatchTSTStation(input_size=12, context_len=24, horizon=12)
+    ext = PatchTST_V2(input_size=12, context_len=24, horizon=12, use_future=True)
     base.eval(); ext.eval()
-    x = torch.randn(8, 24, 12)
+    x, xf = torch.randn(8, 24, 12), torch.randn(8, 12, 6)
     with torch.no_grad():
-        diff = (base(x) - ext(x)).abs().max().item()
-    print(f"chênh lệch với PatchTST gốc tại init: {diff:.2e} (kỳ vọng ~0)")
-    assert diff < 1e-5, "Cổng zero-init không hoạt động đúng!"
+        diff = (base(x) - ext(x, xf)).abs().max().item()
+    print(f"  chênh lệch tại init: {diff:.2e} (kỳ vọng ~0)")
+    assert diff < 1e-5, "Zero-init nhánh future không hoạt động đúng!"
+
+    print("— Test 4: use_future=True nhưng quên truyền x_future -> vẫn chạy —")
+    y2 = ext(x)
+    print(f"  out {tuple(y2.shape)} | OK (nhánh future bị bỏ qua an toàn)")
+
     print("\nTất cả sanity test PASS.")

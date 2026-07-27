@@ -61,7 +61,7 @@ class RevIN(nn.Module):
                  + self.mean[:, 0, target_idx: target_idx + 1]
 
 
-class PatchTST(nn.Module):
+class PatchTST_BASE(nn.Module):
     """PatchTST (supervised, chế độ dự báo — "7 bước").
 
     Parameters
