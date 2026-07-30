@@ -40,7 +40,7 @@ class StationAttention(nn.Module):
         self.norm = nn.LayerNorm(d_model)
         self.attn = nn.MultiheadAttention(d_model, n_heads,
                                           dropout=dropout, batch_first=True)
-        self.alpha = nn.Parameter(torch.zeros(1))   # cổng zero-init (ReZero)
+        self.alpha = nn.Parameter(torch.tensor([0.05]))   # cổng zero-init (ReZero)
         self.station_emb = nn.Parameter(torch.randn(3, 1, d_model) * 0.02)
         self.last_attn = None
 
@@ -55,7 +55,7 @@ class StationAttention(nn.Module):
         out, attn_w = self.attn(h_in, h_in, h_in,
                                 need_weights=True, average_attn_weights=True)
         self.last_attn = attn_w.detach()            # (B, S*N, S*N)
-        h = h + torch.tanh(self.alpha) * out
+        h = h + self.alpha * out
         return h.reshape(B, S, N, D)
 
 
