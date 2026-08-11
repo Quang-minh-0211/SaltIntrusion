@@ -25,6 +25,42 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+class ConvPatchEmbed(nn.Module):
+    """Nhúng patch bằng tích chập 1D — thay cho nn.Linear(patch_len -> d_model).
+ 
+    Drop-in: vào (B*M, N, patch_len) -> ra (B*M, N, d_model), y hệt Linear cũ.
+    Có .out_features để patchTST_CT.py / patchTST_CT_v2.py (đọc
+    self.embed.out_features) không bị vỡ.
+ 
+    Giữ được nhịp triều vì: conv trượt cùng một kernel dọc patch (bất biến
+    tịnh tiến -> bắt cạnh lên/xuống con nước ở mọi pha) + phi tuyến GELU;
+    sau conv KHÔNG pooling nên không làm phẳng lại dao động trong patch.
+    """
+ 
+    def __init__(self, patch_len: int, d_model: int,
+                 conv_channels: int = 16, kernel_size: int = 3,
+                 n_conv: int = 2):
+        super().__init__()
+        self.out_features = d_model
+        self.patch_len = patch_len
+        layers, in_ch = [], 1
+        for _ in range(n_conv):
+            layers += [
+                nn.Conv1d(in_ch, conv_channels, kernel_size,
+                          padding=kernel_size // 2),
+                nn.GELU(),
+            ]
+            in_ch = conv_channels
+        self.conv = nn.Sequential(*layers)
+        self.proj = nn.Linear(conv_channels * patch_len, d_model)
+ 
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        Bm, N, P = x.shape
+        h = x.reshape(Bm * N, 1, P)
+        h = self.conv(h)
+        h = h.reshape(Bm * N, -1)
+        h = self.proj(h)
+        return h.reshape(Bm, N, self.out_features)
 
 class RevIN(nn.Module):
     """Reversible Instance Normalization (Kim et al., 2022).
@@ -91,7 +127,7 @@ class PatchTST_BASE(nn.Module):
                  patch_len: int = 6, stride: int = 6, d_ff: int = 256,
                  dropout: float = 0.2, head_dropout: float = 0.1,
                  target_idx: int = 0, revin: bool = True,
-                 use_future: bool = False, n_future: int = 6):
+                 use_future: bool = False, n_future: int = 6, patch_embed: str = "linear", conv_channels: int = 16, embed_kernel: int = 3):
         super().__init__()
         if context_len < patch_len:
             raise ValueError(
@@ -117,7 +153,10 @@ class PatchTST_BASE(nn.Module):
         self.revin = RevIN(input_size) if revin else None
 
         # (3) -> (4): chiếu patch P chiều lên d_model + positional encoding học được
-        self.embed = nn.Linear(patch_len, d_model)
+        if patch_embed == "linear":
+            self.embed = nn.Linear(patch_len, d_model)
+        elif patch_embed == "conv":
+            self.embed = ConvPatchEmbed(patch_len, d_model, conv_channels=conv_channels, kernel_size=embed_kernel)
         self.pos = nn.Parameter(torch.randn(1, self.n_patches, d_model) * 0.02)
         self.embed_dropout = nn.Dropout(dropout)
 
