@@ -157,6 +157,7 @@ class PatchTST_IntraTCN(nn.Module):
                  n_heads=8,
                  intra_sa_layers=1,        # số lớp SA trong intra (cục bộ, để nhỏ)
                  tcn_levels=2,
+                 inter_layers=None,
                  dropout=0.1,
                  use_future=False,         # model này KHÔNG dùng future covariates
                  **kwargs):
@@ -183,7 +184,7 @@ class PatchTST_IntraTCN(nn.Module):
                                      n_sa_layers=intra_sa_layers,
                                      tcn_levels=tcn_levels, dropout=dropout)
         self.inter = InterPatchBlock(d_model, patch_len, self.num_patch,
-                                     n_heads=n_heads, n_layers=n_layers,
+                                     n_heads=n_heads,n_layers=(inter_layers if inter_layers is not None else n_layers),
                                      dropout=dropout)
         self.fuse_norm = nn.LayerNorm(d_model)
 

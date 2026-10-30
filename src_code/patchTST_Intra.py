@@ -236,6 +236,7 @@ class PatchTST_IntraTCN(nn.Module):
                  longrange=False,          # HƯỚNG 2: bật cross-attention tầm xa
                  n_queries=4,              # số query mỗi patch cho khối tầm xa
                  tcn_levels=2, dropout=0.1,
+                 inter_layers=None,        # số lớp inter-patch; None -> dùng n_layers
                  use_future=False, **kwargs):
         super().__init__()
         self.input_size = input_size
@@ -265,7 +266,9 @@ class PatchTST_IntraTCN(nn.Module):
                                      in_ch=block_in_ch, n_heads=n_heads,
                                      tcn_levels=tcn_levels, dropout=dropout)
         self.inter = InterPatchBlock(d_model, patch_len, P, in_ch=block_in_ch,
-                                     n_heads=n_heads, n_layers=n_layers, dropout=dropout)
+                                     n_heads=n_heads,
+                                     n_layers=(inter_layers if inter_layers is not None else n_layers),
+                                     dropout=dropout)
         self.fuse_norm = nn.LayerNorm(d_model)
 
         # HƯỚNG 2: khối cross-attention tầm xa (đặt sau fuse, trước pool)
