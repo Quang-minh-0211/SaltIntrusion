@@ -170,6 +170,68 @@ class InterPatchBlock(nn.Module):
 
 
 # --------------------------------------------------------------------------
+# HƯỚNG 3 — Inter-patch bằng TOKEN-MIXING (MLP-Mixer) thay cho self-attention.
+# Giữ ĐÚNG interface của InterPatchBlock:
+#     Vào (B*, P, S, in_ch)  ->  Ra (B*, P, d_model)
+#
+# Ý tưởng: embed mỗi patch -> 1 token d_model (y hệt InterPatchBlock), rồi
+# TRỘN GIỮA P patch bằng một MLP TĨNH trên trục patch (token-mixing) thay vì
+# attention động. Hợp lý khi quan hệ giữa các patch ổn định theo vị trí/pha
+# triều (không biến động theo nội dung như trong NLP).
+#
+#   token-mixing : ma trận trộn P x P cố định, học được  (RẺ: ~2*P*hidden)
+#   channel_mix  : (tuỳ chọn) thêm MLP trộn trục đặc trưng d, kiểu Mixer đầy đủ.
+#                  Mặc định TẮT, vì channel-mixing đã được FFN ở nơi khác lo.
+# --------------------------------------------------------------------------
+class InterPatchMixerBlock(nn.Module):
+    def __init__(self, d_model, patch_len, num_patch, in_ch=1,
+                 n_layers=1, token_hidden=None, channel_mix=False,
+                 channel_hidden=None, dropout=0.1, **kwargs):
+        super().__init__()
+        self.embed = nn.Linear(patch_len * in_ch, d_model)
+        self.pos = nn.Parameter(torch.randn(1, num_patch, d_model) * 0.02)
+        token_hidden = token_hidden or max(num_patch * 2, 16)
+        channel_hidden = channel_hidden or d_model * 2
+        self.channel_mix = channel_mix
+
+        self.token_norms = nn.ModuleList()
+        self.token_mlps = nn.ModuleList()
+        self.chan_norms = nn.ModuleList() if channel_mix else None
+        self.chan_mlps = nn.ModuleList() if channel_mix else None
+        for _ in range(n_layers):
+            self.token_norms.append(nn.LayerNorm(d_model))
+            # token-MLP hoạt động TRÊN TRỤC P (num_patch): P -> hidden -> P
+            self.token_mlps.append(nn.Sequential(
+                nn.Linear(num_patch, token_hidden), nn.GELU(),
+                nn.Dropout(dropout), nn.Linear(token_hidden, num_patch),
+                nn.Dropout(dropout)))
+            if channel_mix:
+                self.chan_norms.append(nn.LayerNorm(d_model))
+                self.chan_mlps.append(nn.Sequential(
+                    nn.Linear(d_model, channel_hidden), nn.GELU(),
+                    nn.Dropout(dropout), nn.Linear(channel_hidden, d_model),
+                    nn.Dropout(dropout)))
+
+    def forward(self, patches):                    # (B*, P, S, in_ch)
+        B_, P, S, ic = patches.shape
+        x = self.embed(patches.reshape(B_, P, S * ic))        # (B*, P, d)
+        x = x + self.pos
+        for i in range(len(self.token_mlps)):
+            # --- token-mixing: trộn dọc trục P (giữa các patch) ---
+            y = self.token_norms[i](x)             # (B*, P, d)
+            y = y.transpose(1, 2)                  # (B*, d, P)  MLP chạy trên P
+            y = self.token_mlps[i](y)              # (B*, d, P)
+            y = y.transpose(1, 2)                  # (B*, P, d)
+            x = x + y                              # residual
+            # --- channel-mixing (tuỳ chọn): trộn trục đặc trưng d ---
+            if self.channel_mix:
+                y = self.chan_norms[i](x)
+                y = self.chan_mlps[i](y)           # (B*, P, d) MLP chạy trên d
+                x = x + y                          # residual
+        return x                                   # (B*, P, d_model)
+
+
+# --------------------------------------------------------------------------
 # HƯỚNG 2 — Cross-attention bất đối xứng tầm xa.
 # Mỗi patch phát k query (phái sinh nội dung) đọc TOÀN BỘ L=P*S điểm ở độ
 # phân giải điểm, rồi rót ngược ngữ cảnh về từng điểm. Chi phí O(P*k*L)
@@ -237,6 +299,9 @@ class PatchTST_IntraTCN(nn.Module):
                  n_queries=4,              # số query mỗi patch cho khối tầm xa
                  tcn_levels=2, dropout=0.1,
                  inter_layers=None,        # số lớp inter-patch; None -> dùng n_layers
+                 inter_mode="attn",        # HƯỚNG 3: "attn" (gốc) | "mixer" (token-mixing)
+                 inter_channel_mix=False,  # chỉ dùng khi inter_mode="mixer"
+                 inter_token_hidden=None,  # hidden cho token-MLP (None -> 2*P)
                  use_future=False, **kwargs):
         super().__init__()
         self.input_size = input_size
@@ -265,10 +330,19 @@ class PatchTST_IntraTCN(nn.Module):
         self.intra = IntraPatchBlock(d_model, patch_len, intra_mode=intra_mode,
                                      in_ch=block_in_ch, n_heads=n_heads,
                                      tcn_levels=tcn_levels, dropout=dropout)
-        self.inter = InterPatchBlock(d_model, patch_len, P, in_ch=block_in_ch,
-                                     n_heads=n_heads,
-                                     n_layers=(inter_layers if inter_layers is not None else n_layers),
-                                     dropout=dropout)
+        _inter_L = inter_layers if inter_layers is not None else n_layers
+        if inter_mode == "attn":
+            self.inter = InterPatchBlock(d_model, patch_len, P, in_ch=block_in_ch,
+                                         n_heads=n_heads, n_layers=_inter_L,
+                                         dropout=dropout)
+        elif inter_mode == "mixer":
+            self.inter = InterPatchMixerBlock(d_model, patch_len, P, in_ch=block_in_ch,
+                                              n_layers=_inter_L,
+                                              token_hidden=inter_token_hidden,
+                                              channel_mix=inter_channel_mix,
+                                              dropout=dropout)
+        else:
+            raise ValueError(f"inter_mode không hợp lệ: {inter_mode}")
         self.fuse_norm = nn.LayerNorm(d_model)
 
         # HƯỚNG 2: khối cross-attention tầm xa (đặt sau fuse, trước pool)
