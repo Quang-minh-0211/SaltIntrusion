@@ -102,7 +102,16 @@ class IntraPatchBlock(nn.Module):
             self.act = nn.GELU()
             self.drop = nn.Dropout(dropout)
             return
-
+                # ABLATION: bỏ attention trong patch
+        if intra_mode in ("linear", "mlp"):
+            self.embed = nn.Linear(in_ch, d_model)          # trộn kênh nếu in_ch=C
+            self.pos = nn.Parameter(torch.randn(1, patch_len, d_model) * 0.02)
+            if intra_mode == "mlp":                         # giữ FFN, chỉ bỏ attention
+                self.norm = nn.LayerNorm(d_model)
+                self.ffn = nn.Sequential(
+                    nn.Linear(d_model, d_model * 2), nn.GELU(), nn.Dropout(dropout),
+                    nn.Linear(d_model * 2, d_model), nn.Dropout(dropout))
+            return
         # các chế độ có self-attention
         self.pos = nn.Parameter(torch.randn(1, patch_len, d_model) * 0.02)
         enc = nn.TransformerEncoderLayer(
@@ -121,7 +130,13 @@ class IntraPatchBlock(nn.Module):
             return None
         if self.mode == "conv":
             h = self.conv(x.transpose(1, 2))       # (B*, d_model, S)
-            return self.drop(self.act(h)).transpose(1, 2)     # (B*, S, d_model)
+            return self.drop(self.act(h)).transpose(1, 2)
+        # (B*, S, d_model)
+        if self.mode == "linear":                  # chỉ nhúng từng điểm
+            return self.embed(x) + self.pos
+        if self.mode == "mlp":                     # nhúng + FFN, không attention
+            h = self.embed(x) + self.pos
+            return h + self.ffn(self.norm(h))      # pre-norm residual như trong Transformer
         if self.mode == "attn":
             h = self.embed(x)                      # (B*, S, d_model)
             return self.sa(h + self.pos)
@@ -341,6 +356,10 @@ class PatchTST_IntraTCN(nn.Module):
                                               token_hidden=inter_token_hidden,
                                               channel_mix=inter_channel_mix,
                                               dropout=dropout)
+        elif inter_mode == "none":
+            if intra_mode == "none":
+                raise ValueError("Không thể tắt cả intra lẫn inter cùng lúc")
+            self.inter = None
         else:
             raise ValueError(f"inter_mode không hợp lệ: {inter_mode}")
         self.fuse_norm = nn.LayerNorm(d_model)
@@ -369,6 +388,11 @@ class PatchTST_IntraTCN(nn.Module):
             x = nn.functional.pad(x, (0, self.pad), mode="replicate")
         return x.unfold(dimension=-1, size=self.patch_len, step=self.stride)
 
+    def _fuse(self, intra, inter):                  # mỗi nhánh có thể là None
+        if intra is not None and inter is not None:
+            return self.fuse_norm(intra + inter)
+        return self.fuse_norm(intra if intra is not None else inter)
+    
     def _pool(self, z):                             # (N, P, S, d) -> (N, P, S, d) | (N, P, d)
         if self.pool_mode == "flatten":
             return z
@@ -387,14 +411,14 @@ class PatchTST_IntraTCN(nn.Module):
         if self.channel_mode == "ci_late":
             # ---- channel-independent: B*C luồng đơn biến ----
             pc = patches.reshape(B * C, P, S).unsqueeze(-1)  # (B*C, P, S, 1)
-            inter = self.inter(pc)                           # (B*C, P, d)
-            inter = inter.unsqueeze(2).expand(-1, -1, S, -1) # (B*C, P, S, d)
-            intra = self.intra(pc.reshape(B * C * P, S, 1))  # (B*C*P, S, d) | None
+            inter = None
+            if self.inter is not None:
+                inter = self.inter(pc)                       # (B*C, P, d)
+                inter = inter.unsqueeze(2).expand(-1, -1, S, -1)
+            intra = self.intra(pc.reshape(B * C * P, S, 1))
             if intra is not None:
                 intra = intra.reshape(B * C, P, S, -1)
-                z = self.fuse_norm(intra + inter)
-            else:
-                z = self.fuse_norm(inter)
+            z = self._fuse(intra, inter)
             if self.longrange is not None:                   # HƯỚNG 2
                 z = self.longrange(z)
             y = self.head(self._pool(z))                     # (B*C, H)
@@ -403,14 +427,14 @@ class PatchTST_IntraTCN(nn.Module):
         else:
             # ---- mixed: mỗi patch mang cả C kênh, trộn kênh sớm ----
             pm = patches.permute(0, 2, 3, 1)                 # (B, P, S, C)
-            inter = self.inter(pm)                           # (B, P, d)
-            inter = inter.unsqueeze(2).expand(-1, -1, S, -1) # (B, P, S, d)
+            inter = None
+            if self.inter is not None:
+                inter = self.inter(pm)                       # (B, P, d)
+                inter = inter.unsqueeze(2).expand(-1, -1, S, -1)
             intra = self.intra(pm.reshape(B * P, S, C))      # (B*P, S, d) | None
             if intra is not None:
                 intra = intra.reshape(B, P, S, -1)
-                z = self.fuse_norm(intra + inter)
-            else:
-                z = self.fuse_norm(inter)
+            z = self._fuse(intra, inter)
             if self.longrange is not None:                   # HƯỚNG 2
                 z = self.longrange(z)
             y = self.head(self._pool(z))                     # (B, H) trực tiếp
