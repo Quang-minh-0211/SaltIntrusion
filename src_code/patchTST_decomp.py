@@ -12,7 +12,24 @@ Kiến trúc theo thiết kế đã thống nhất:
     ŷ = head_seasonal(flatten seasonal_rep) + head_trend(flatten trend_rep)
   RevIN denormalize (kênh target_idx)
 
+Cờ ablation (3 nhánh, 3 cờ độc lập, đặt "none" để tắt — giống intra_mode):
+  trend_mode  : "inter"    | "none"     (nhánh trend đi qua inter)
+  period_mode : "autocorr" | "none"     (nhánh chu kỳ: Auto-Correlation)
+  fast_mode   : "intra"    | "none"     (nhánh biến động nhanh: intra)
+  Ví dụ: để lại AC + inter, tắt intra -> fast_mode="none".
+         chỉ còn AC         -> trend_mode="none", fast_mode="none".
+
+Cờ sửa luồng thông tin (mặc định giữ hành vi cũ):
+  revin_mode  : "all" | "target_only"   "target_only": kênh phụ giữ mức nền
+  stats_token : True | False            đưa (μ, log σ) của RevIN trở lại vào mạng
+  stats_target: "trend" | "all"         "trend": chỉ nhánh trend (như trước)
+                                        "all"  : cả trend, period và fast
+  branch_norm : True | False            LayerNorm đầu ra trend / period / fast
+
 Ghi chú:
+  - IntraPatchBlock và InterPatchBlock giống hệt bản RIVF (patchTST_Intra.py,
+    intra_mode="attn", inter_mode="attn"): nạp được nguyên trọng số (strict).
+    Inter mặc định dùng n_layers lớp như RIVF (trend_layers=None).
   - channel mixing SỚM (mixed): intra/inter/period_embed đều nhận in_ch=C.
   - Auto-Correlation chạy point-level trên chuỗi L rồi reshape về (B,P,S,d);
     điều này yêu cầu stride == patch_len (patch không chồng lấn) để căn thời
@@ -35,16 +52,31 @@ import torch.nn.functional as F
 # của kênh mục tiêu.
 # --------------------------------------------------------------------------
 class RevIN(nn.Module):
-    def __init__(self, eps=1e-5):
+    """mode="all": chuẩn hoá mọi kênh theo cửa sổ (như cũ).
+       mode="target_only": chỉ chuẩn hoá kênh đích; kênh phụ giữ mức nền."""
+    def __init__(self, eps=1e-5, mode="all", target_idx=0):
         super().__init__()
+        if mode not in ("all", "target_only"):
+            raise ValueError(f"revin_mode không hợp lệ: {mode}")
         self.eps = eps
+        self.mode = mode
+        self.target_idx = target_idx
         self._mean = None
         self._std = None
 
     def normalize(self, x):                        # (B, C, L)
         self._mean = x.mean(-1, keepdim=True)
         self._std = torch.sqrt(x.var(-1, keepdim=True, unbiased=False) + self.eps)
-        return (x - self._mean) / self._std
+        xn = (x - self._mean) / self._std
+        if self.mode == "all":
+            return xn
+        mask = torch.zeros(1, x.shape[1], 1, device=x.device, dtype=x.dtype)
+        mask[:, self.target_idx] = 1.0
+        return xn * mask + x * (1.0 - mask)        # chỉ kênh đích bị chuẩn hoá
+
+    def stats(self):                               # -> (B, 2C): [μ_c ; log σ_c]
+        return torch.cat([self._mean.squeeze(-1),
+                          torch.log(self._std.squeeze(-1))], dim=-1)
 
     def denormalize_target(self, y, target_idx):   # y: (B, H)
         return y * self._std[:, target_idx, :] + self._mean[:, target_idx, :]
@@ -83,8 +115,11 @@ class IntraPatchBlock(nn.Module):
             dropout=dropout, activation="gelu", batch_first=True, norm_first=True)
         self.sa = nn.TransformerEncoder(enc, num_layers=1, enable_nested_tensor=False)
 
-    def forward(self, x):                          # (B*, S, in_ch)
-        return self.sa(self.embed(x) + self.pos)   # (B*, S, d)
+    def forward(self, x, cond=None):               # (B*, S, in_ch); cond: (B*, d) | None
+        h = self.embed(x)
+        if cond is not None:
+            h = h + cond.unsqueeze(1)              # stats token cho mọi điểm
+        return self.sa(h + self.pos)               # (B*, S, d)
 
 
 # --------------------------------------------------------------------------
@@ -103,9 +138,11 @@ class InterPatchBlock(nn.Module):
         self.sa = nn.TransformerEncoder(enc, num_layers=n_layers,
                                         enable_nested_tensor=False)
 
-    def forward(self, patches):                    # (B, P, S, in_ch)
+    def forward(self, patches, cond=None):         # (B, P, S, in_ch); cond: (B, d) | None
         B_, P, S, ic = patches.shape
         tok = self.embed(patches.reshape(B_, P, S * ic))      # (B, P, d)
+        if cond is not None:
+            tok = tok + cond.unsqueeze(1)          # stats token cho mọi patch
         return self.sa(tok + self.pos)             # (B, P, d)
 
 
@@ -183,9 +220,17 @@ class PatchTST_Decomp(nn.Module):
     def __init__(self,
                  input_size, context_len, horizon,
                  d_model=256, patch_len=6, stride=6, target_idx=0,
-                 n_heads=8, decomp_kernel=13, trend_layers=2,
+                 n_layers=4,                # số lớp inter — giống n_layers của bản RIVF
+                 n_heads=8, decomp_kernel=13,
+                 trend_layers=None,         # None -> dùng n_layers (khớp RIVF)
                  ac_top_k=3, ac_factor=1, dropout=0.1,
-                 use_trend=True, use_period=True, use_fast=True,
+                 trend_mode="inter",        # "inter"    | "none"
+                 period_mode="autocorr",    # "autocorr" | "none"
+                 fast_mode="intra",         # "intra"    | "none"
+                 revin_mode="all",          # "all" | "target_only"
+                 stats_token=False,         # (μ, log σ) của RevIN trở lại vào mạng
+                 stats_target="trend",      # "trend" | "all" (trend + period + fast)
+                 branch_norm=False,         # LayerNorm đầu ra mỗi nhánh
                  return_gate=False, **kwargs):
         super().__init__()
         assert stride == patch_len, (
@@ -209,18 +254,44 @@ class PatchTST_Decomp(nn.Module):
         P = self.num_patch
         C = input_size
 
-        self.use_trend = use_trend
-        self.use_period = use_period
-        self.use_fast = use_fast
+        # Ba cờ ablation độc lập, mỗi nhánh một cờ ("none" để tắt).
+        if trend_mode not in ("inter", "none"):
+            raise ValueError(f"trend_mode không hợp lệ: {trend_mode}")
+        if period_mode not in ("autocorr", "none"):
+            raise ValueError(f"period_mode không hợp lệ: {period_mode}")
+        if fast_mode not in ("intra", "none"):
+            raise ValueError(f"fast_mode không hợp lệ: {fast_mode}")
+        self.trend_mode, self.period_mode, self.fast_mode = trend_mode, period_mode, fast_mode
+        use_trend = trend_mode != "none"       # trend  -> nhánh inter
+        use_period = period_mode != "none"     # period -> Auto-Correlation
+        use_fast = fast_mode != "none"         # fast   -> nhánh intra
         assert use_trend or use_period or use_fast, \
-            "Phải bật ít nhất một nhánh (trend/period/fast)."
+            "Phải bật ít nhất một nhánh (trend/period/fast không cùng 'none')."
+        self.use_trend, self.use_period, self.use_fast = use_trend, use_period, use_fast
 
-        self.revin = RevIN()
+        self.revin_mode = revin_mode
+        self.revin = RevIN(mode=revin_mode, target_idx=target_idx)
         self.decomp = SeriesDecomp(decomp_kernel)
+        # stats token: một phép chiếu dùng chung (giống Proposed), đưa tới các nhánh
+        # theo stats_target. "trend": chỉ trend; "all": trend + period + fast.
+        if stats_target not in ("trend", "all"):
+            raise ValueError(f"stats_target không hợp lệ: {stats_target}")
+        self.stats_target = stats_target
+        self.stats_to_trend = stats_token and use_trend
+        self.stats_to_seasonal = stats_token and stats_target == "all"
+        self.stats_proj = (nn.Linear(2 * C, d_model)
+                           if (self.stats_to_trend
+                               or (self.stats_to_seasonal and (use_period or use_fast)))
+                           else None)
+        # branch_norm: LayerNorm đầu ra của từng nhánh
+        self.trend_norm = nn.LayerNorm(d_model) if (branch_norm and use_trend) else None
+        self.period_norm = nn.LayerNorm(d_model) if (branch_norm and use_period) else None
+        self.fast_norm = nn.LayerNorm(d_model) if (branch_norm and use_fast) else None
 
-        # TREND -> inter
+        # TREND -> inter (cùng kiến trúc InterPatchBlock của RIVF, cùng số lớp)
+        _trend_L = trend_layers if trend_layers is not None else n_layers
         self.inter = (InterPatchBlock(d_model, patch_len, P, in_ch=C,
-                                      n_heads=n_heads, n_layers=trend_layers,
+                                      n_heads=n_heads, n_layers=_trend_L,
                                       dropout=dropout) if use_trend else None)
         # SEASONAL: period (Auto-Correlation)
         if use_period:
@@ -267,12 +338,15 @@ class PatchTST_Decomp(nn.Module):
         P, S = self.num_patch, self.patch_len
         xn = self.revin.normalize(x.transpose(1, 2))           # (B, C, L)
         trend, seasonal = self.decomp(xn)                      # (B, C, L) mỗi cái
+        s = self.stats_proj(self.revin.stats()) if self.stats_proj is not None else None
 
         # --- TREND -> inter ---
         trend_rep = None
         if self.inter is not None:
             tr = self._patchify(trend).permute(0, 2, 3, 1)     # (B, P, S, C)
-            trend_rep = self.inter(tr)                         # (B, P, d)
+            trend_rep = self.inter(tr, s if self.stats_to_trend else None)   # (B, P, d)
+            if self.trend_norm is not None:
+                trend_rep = self.trend_norm(trend_rep)
 
         # --- SEASONAL: period (Auto-Correlation point-level) ---
         period = None
@@ -280,14 +354,23 @@ class PatchTST_Decomp(nn.Module):
             se_pad = seasonal if self.pad == 0 else F.pad(
                 seasonal, (0, self.pad), mode="replicate")     # (B, C, L_pad)
             se_pts = se_pad.transpose(1, 2)                    # (B, L_pad, C)
-            period = self.autocorr(self.period_embed(se_pts))  # (B, L_pad, d)
+            emb = self.period_embed(se_pts)                    # (B, L_pad, d)
+            if self.stats_to_seasonal:
+                emb = emb + s.unsqueeze(1)                     # stats token cho mọi điểm
+            period = self.autocorr(emb)                        # (B, L_pad, d)
             period = period.reshape(B, P, S, -1)               # (B, P, S, d)
+            if self.period_norm is not None:
+                period = self.period_norm(period)
 
         # --- SEASONAL: fast (intra patch-level) ---
         fast = None
         if self.intra is not None:
             se_pm = self._patchify(seasonal).permute(0, 2, 3, 1)   # (B, P, S, C)
-            fast = self.intra(se_pm.reshape(B * P, S, C)).reshape(B, P, S, -1)
+            fast = self.intra(se_pm.reshape(B * P, S, C),
+                              s.repeat_interleave(P, 0) if self.stats_to_seasonal else None
+                              ).reshape(B, P, S, -1)
+            if self.fast_norm is not None:
+                fast = self.fast_norm(fast)
 
         # --- hợp seasonal: gate khi đủ hai, không thì dùng nhánh còn lại ---
         gate = None
@@ -340,12 +423,13 @@ if __name__ == "__main__":
     B, L, C, H = 4, 168, 3, 18
     x = torch.randn(B, L, C)
     configs = [
-        ("full             ", dict()),
-        ("w/o period (AC)  ", dict(use_period=False)),
-        ("w/o fast (intra) ", dict(use_fast=False)),
-        ("w/o trend        ", dict(use_trend=False)),
-        ("period only       ", dict(use_fast=False, use_trend=False)),
-        ("fast only         ", dict(use_period=False, use_trend=False)),
+        ("full                     ", dict()),
+        ("w/o period (AC)          ", dict(period_mode="none")),
+        ("w/o fast (intra)         ", dict(fast_mode="none")),
+        ("w/o trend                ", dict(trend_mode="none")),
+        ("period only              ", dict(trend_mode="none", fast_mode="none")),
+        ("fast only                ", dict(trend_mode="none", period_mode="none")),
+        ("trend only               ", dict(period_mode="none", fast_mode="none")),
     ]
     for name, kw in configs:
         m = PatchTST_Decomp(input_size=C, context_len=L, horizon=H,
@@ -356,7 +440,28 @@ if __name__ == "__main__":
         print(f"{name} out={tuple(y.shape)} total={cnt(m):>9,} no_grad={ng}")
     try:
         PatchTST_Decomp(input_size=C, context_len=L, horizon=H,
-                        use_trend=False, use_period=False, use_fast=False)
+                        trend_mode="none", period_mode="none", fast_mode="none")
     except AssertionError:
         print("guard (tắt hết) OK")
+    print("Kiểm tra revin_mode / stats_token / branch_norm:")
+    for pm in ["autocorr", "none"]:
+        for rm in ["all", "target_only"]:
+            for st in [False, True]:
+                for bn in [False, True]:
+                    m = PatchTST_Decomp(input_size=C, context_len=L, horizon=H,
+                                        d_model=256, patch_len=6, stride=6, target_idx=0,
+                                        period_mode=pm, revin_mode=rm,
+                                        stats_token=st, branch_norm=bn)
+                    y = m(x); y.sum().backward()
+                    ng = sum(p.grad is None for p in m.parameters())
+                    assert y.shape == (B, H) and ng == 0, (pm, rm, st, bn, ng)
+    print("Kiểm tra stats_target:")
+    for tgt in ["trend", "all"]:
+        for kw in [dict(), dict(period_mode="none"), dict(trend_mode="none")]:
+            m = PatchTST_Decomp(input_size=C, context_len=L, horizon=H, d_model=256,
+                                patch_len=6, stride=6, target_idx=0,
+                                stats_token=True, stats_target=tgt, **kw)
+            y = m(x); y.sum().backward()
+            ng = sum(p.grad is None for p in m.parameters())
+            assert y.shape == (B, H) and ng == 0, (tgt, kw, ng)
     print("OK.")

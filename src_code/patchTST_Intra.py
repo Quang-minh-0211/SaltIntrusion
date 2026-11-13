@@ -19,6 +19,21 @@ một cờ, mặc định giữ hành vi để tái lập baseline khi cần:
          trích đặc trưng (Conv/attention/Linear trên chiều kênh), ra thẳng
          1 chuỗi mục tiêu, không cộng kênh cuối.
 
+  FIX 4  revin_mode   : "all" | "target_only"
+         "all" = RevIN chuẩn hoá mọi kênh theo cửa sổ (như cũ, xoá mức nền).
+         "target_only" = chỉ chuẩn hoá kênh đích; kênh phụ giữ mức nền
+         (đã qua StandardScaler toàn cục).
+
+  FIX 5  stats_token  : True | False
+         Đưa (μ, log σ) mà RevIN đã gỡ của mọi kênh trở lại vào mạng:
+         Linear(2C -> d_model), cộng vào token của intra và inter sau embed.
+
+  FIX 6  branch_norm  : True | False
+         LayerNorm đầu ra của nhánh intra và nhánh inter trước khi cộng, để
+         hai nhánh cùng thang đo (encoder pre-norm không có LayerNorm cuối).
+
+  Mặc định FIX 4–6 = "all", False, False -> giữ nguyên hành vi cũ.
+
 Interface khớp pipeline:
     model = PatchTST_IntraTCN(input_size=C, context_len=168, horizon=24,
                               d_model=128, n_layers=3, patch_len=6, stride=6,
@@ -38,16 +53,32 @@ import torch.nn as nn
 # của kênh mục tiêu (target_idx).
 # --------------------------------------------------------------------------
 class RevIN(nn.Module):
-    def __init__(self, eps: float = 1e-5):
+    """mode="all": chuẩn hoá mọi kênh theo cửa sổ (như cũ).
+       mode="target_only": chỉ chuẩn hoá kênh đích; kênh phụ giữ nguyên
+       (đã qua StandardScaler toàn cục) nên còn mức nền."""
+    def __init__(self, eps: float = 1e-5, mode: str = "all", target_idx: int = 0):
         super().__init__()
+        if mode not in ("all", "target_only"):
+            raise ValueError(f"revin_mode không hợp lệ: {mode}")
         self.eps = eps
+        self.mode = mode
+        self.target_idx = target_idx
         self._mean = None
         self._std = None
 
     def normalize(self, x):                       # x: (B, C, L)
         self._mean = x.mean(dim=-1, keepdim=True)
         self._std = torch.sqrt(x.var(dim=-1, keepdim=True, unbiased=False) + self.eps)
-        return (x - self._mean) / self._std
+        xn = (x - self._mean) / self._std
+        if self.mode == "all":
+            return xn
+        mask = torch.zeros(1, x.shape[1], 1, device=x.device, dtype=x.dtype)
+        mask[:, self.target_idx] = 1.0
+        return xn * mask + x * (1.0 - mask)        # chỉ kênh đích bị chuẩn hoá
+
+    def stats(self):                              # -> (B, 2C): [μ_c ; log σ_c]
+        return torch.cat([self._mean.squeeze(-1),
+                          torch.log(self._std.squeeze(-1))], dim=-1)
 
     def denormalize_target(self, y, target_idx):  # y: (B, H)
         mean = self._mean[:, target_idx, :]
@@ -125,23 +156,24 @@ class IntraPatchBlock(nn.Module):
         else:
             raise ValueError(f"intra_mode không hợp lệ: {intra_mode}")
 
-    def forward(self, x):                          # x: (B*, S, in_ch)
+    def forward(self, x, cond=None):               # x: (B*, S, in_ch); cond: (B*, d) | None
         if self.mode == "none":
             return None
+        c = 0 if cond is None else cond.unsqueeze(1)          # stats token cho mọi điểm
         if self.mode == "conv":
             h = self.conv(x.transpose(1, 2))       # (B*, d_model, S)
-            return self.drop(self.act(h)).transpose(1, 2)
+            return self.drop(self.act(h)).transpose(1, 2) + c
         # (B*, S, d_model)
         if self.mode == "linear":                  # chỉ nhúng từng điểm
-            return self.embed(x) + self.pos
+            return self.embed(x) + self.pos + c
         if self.mode == "mlp":                     # nhúng + FFN, không attention
-            h = self.embed(x) + self.pos
+            h = self.embed(x) + self.pos + c
             return h + self.ffn(self.norm(h))      # pre-norm residual như trong Transformer
         if self.mode == "attn":
-            h = self.embed(x)                      # (B*, S, d_model)
+            h = self.embed(x) + c                  # (B*, S, d_model)
             return self.sa(h + self.pos)
         # tcn_attn
-        h = self.tcn(x.transpose(1, 2)).transpose(1, 2)       # (B*, S, d_model)
+        h = self.tcn(x.transpose(1, 2)).transpose(1, 2) + c   # (B*, S, d_model)
         return self.sa(h + self.pos)
 
 
@@ -178,9 +210,11 @@ class InterPatchBlock(nn.Module):
             dropout=dropout, activation="gelu", batch_first=True, norm_first=True)
         self.sa = nn.TransformerEncoder(enc, num_layers=n_layers, enable_nested_tensor=False)
 
-    def forward(self, patches):                    # (B*, P, S, in_ch)
+    def forward(self, patches, cond=None):         # (B*, P, S, in_ch); cond: (B*, d) | None
         B_, P, S, ic = patches.shape
         tok = self.embed(patches.reshape(B_, P, S * ic))      # (B*, P, d_model)
+        if cond is not None:
+            tok = tok + cond.unsqueeze(1)          # stats token cho mọi patch
         return self.sa(tok + self.pos)             # (B*, P, d_model)
 
 
@@ -227,10 +261,12 @@ class InterPatchMixerBlock(nn.Module):
                     nn.Dropout(dropout), nn.Linear(channel_hidden, d_model),
                     nn.Dropout(dropout)))
 
-    def forward(self, patches):                    # (B*, P, S, in_ch)
+    def forward(self, patches, cond=None):         # (B*, P, S, in_ch); cond: (B*, d) | None
         B_, P, S, ic = patches.shape
         x = self.embed(patches.reshape(B_, P, S * ic))        # (B*, P, d)
         x = x + self.pos
+        if cond is not None:
+            x = x + cond.unsqueeze(1)              # stats token cho mọi patch
         for i in range(len(self.token_mlps)):
             # --- token-mixing: trộn dọc trục P (giữa các patch) ---
             y = self.token_norms[i](x)             # (B*, P, d)
@@ -317,6 +353,9 @@ class PatchTST_IntraTCN(nn.Module):
                  inter_mode="attn",        # HƯỚNG 3: "attn" (gốc) | "mixer" (token-mixing)
                  inter_channel_mix=False,  # chỉ dùng khi inter_mode="mixer"
                  inter_token_hidden=None,  # hidden cho token-MLP (None -> 2*P)
+                 revin_mode="all",         # FIX 4: "all" | "target_only"
+                 stats_token=False,        # FIX 5: đưa (μ, log σ) trở lại vào mạng
+                 branch_norm=False,        # FIX 6: LayerNorm mỗi nhánh trước khi cộng
                  use_future=False, **kwargs):
         super().__init__()
         self.input_size = input_size
@@ -341,7 +380,10 @@ class PatchTST_IntraTCN(nn.Module):
         # mixed xử lý B luồng, mỗi patch mang cả C kênh (in_ch=C).
         block_in_ch = 1 if channel_mode == "ci_late" else input_size
 
-        self.revin = RevIN()
+        self.revin_mode = revin_mode
+        self.revin = RevIN(mode=revin_mode, target_idx=target_idx)
+        # FIX 5: (μ, log σ) của C kênh -> vector d_model, cộng vào token các nhánh
+        self.stats_proj = nn.Linear(2 * input_size, d_model) if stats_token else None
         self.intra = IntraPatchBlock(d_model, patch_len, intra_mode=intra_mode,
                                      in_ch=block_in_ch, n_heads=n_heads,
                                      tcn_levels=tcn_levels, dropout=dropout)
@@ -363,6 +405,11 @@ class PatchTST_IntraTCN(nn.Module):
         else:
             raise ValueError(f"inter_mode không hợp lệ: {inter_mode}")
         self.fuse_norm = nn.LayerNorm(d_model)
+        # FIX 6: đưa hai nhánh về cùng thang đo trước khi cộng
+        self.intra_norm = (nn.LayerNorm(d_model)
+                           if (branch_norm and intra_mode != "none") else None)
+        self.inter_norm = (nn.LayerNorm(d_model)
+                           if (branch_norm and self.inter is not None) else None)
 
         # HƯỚNG 2: khối cross-attention tầm xa (đặt sau fuse, trước pool)
         self.longrange = (LongRangeCrossAttention(d_model, P, patch_len,
@@ -407,16 +454,23 @@ class PatchTST_IntraTCN(nn.Module):
         x = self.revin.normalize(x.transpose(1, 2))          # (B, C, L)
         patches = self._patchify(x)                          # (B, C, P, S)
         P, S = self.num_patch, self.patch_len
+        # FIX 5: stats token (B, d) từ các thống kê RevIN đã gỡ
+        s = self.stats_proj(self.revin.stats()) if self.stats_proj is not None else None
 
         if self.channel_mode == "ci_late":
             # ---- channel-independent: B*C luồng đơn biến ----
             pc = patches.reshape(B * C, P, S).unsqueeze(-1)  # (B*C, P, S, 1)
             inter = None
             if self.inter is not None:
-                inter = self.inter(pc)                       # (B*C, P, d)
+                inter = self.inter(pc, None if s is None else s.repeat_interleave(C, 0))
+                if self.inter_norm is not None:
+                    inter = self.inter_norm(inter)
                 inter = inter.unsqueeze(2).expand(-1, -1, S, -1)
-            intra = self.intra(pc.reshape(B * C * P, S, 1))
+            intra = self.intra(pc.reshape(B * C * P, S, 1),
+                               None if s is None else s.repeat_interleave(C * P, 0))
             if intra is not None:
+                if self.intra_norm is not None:
+                    intra = self.intra_norm(intra)
                 intra = intra.reshape(B * C, P, S, -1)
             z = self._fuse(intra, inter)
             if self.longrange is not None:                   # HƯỚNG 2
@@ -429,10 +483,15 @@ class PatchTST_IntraTCN(nn.Module):
             pm = patches.permute(0, 2, 3, 1)                 # (B, P, S, C)
             inter = None
             if self.inter is not None:
-                inter = self.inter(pm)                       # (B, P, d)
+                inter = self.inter(pm, s)                    # (B, P, d)
+                if self.inter_norm is not None:
+                    inter = self.inter_norm(inter)
                 inter = inter.unsqueeze(2).expand(-1, -1, S, -1)
-            intra = self.intra(pm.reshape(B * P, S, C))      # (B*P, S, d) | None
+            intra = self.intra(pm.reshape(B * P, S, C),      # (B*P, S, d) | None
+                               None if s is None else s.repeat_interleave(P, 0))
             if intra is not None:
+                if self.intra_norm is not None:
+                    intra = self.intra_norm(intra)
                 intra = intra.reshape(B, P, S, -1)
             z = self._fuse(intra, inter)
             if self.longrange is not None:                   # HƯỚNG 2
@@ -477,4 +536,17 @@ if __name__ == "__main__":
                 n = sum(p.numel() for p in m.parameters())
                 print(f"  channel={cm:8s} intra={im:5s} pool={pm:8s} "
                       f"-> out={tuple(y.shape)} params={n:>10,}")
+    print("Kiểm tra FIX 4–6:")
+    for cm in ["ci_late", "mixed"]:
+        for rm in ["all", "target_only"]:
+            for st in [False, True]:
+                for bn in [False, True]:
+                    m = PatchTST_IntraTCN(input_size=C, context_len=L, horizon=H,
+                                          d_model=128, n_layers=3, patch_len=6, stride=6,
+                                          target_idx=0, intra_mode="attn",
+                                          pool_mode="flatten", channel_mode=cm,
+                                          revin_mode=rm, stats_token=st, branch_norm=bn)
+                    y = m(x); y.sum().backward()
+                    ng = sum(p.grad is None for p in m.parameters())
+                    assert y.shape == (B, H) and ng == 0, (cm, rm, st, bn, ng)
     print("OK.")
