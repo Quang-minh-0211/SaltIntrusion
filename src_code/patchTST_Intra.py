@@ -86,33 +86,6 @@ class RevIN(nn.Module):
         return y * std + mean
 
 
-# --------------------------------------------------------------------------
-# TCN: tích chập giãn nở có residual. Vào (B*, in_ch, S) -> ra (B*, d_model, S).
-# (dùng cho intra_mode="tcn_attn"; in_ch=1 ở ci_late, =C ở mixed)
-# --------------------------------------------------------------------------
-class TCN(nn.Module):
-    def __init__(self, d_model, in_ch=1, n_levels=2, kernel_size=3, dropout=0.1):
-        super().__init__()
-        layers = []
-        c = in_ch
-        for i in range(n_levels):
-            dilation = 2 ** i
-            pad = dilation * (kernel_size - 1) // 2
-            layers += [nn.Conv1d(c, d_model, kernel_size, padding=pad, dilation=dilation),
-                       nn.GELU(), nn.Dropout(dropout)]
-            c = d_model
-        self.net = nn.ModuleList(layers)
-        self.res_proj = nn.Conv1d(in_ch, d_model, 1)
-
-    def forward(self, x):                          # x: (B*, in_ch, S)
-        res = self.res_proj(x)
-        out = x
-        for layer in self.net:
-            out = layer(out)
-            if isinstance(layer, nn.Dropout):
-                out = out + res
-                res = out
-        return out                                 # (B*, d_model, S)
 
 
 # --------------------------------------------------------------------------
@@ -121,7 +94,7 @@ class TCN(nn.Module):
 # --------------------------------------------------------------------------
 class IntraPatchBlock(nn.Module):
     def __init__(self, d_model, patch_len, intra_mode="conv", in_ch=1,
-                 n_heads=8, tcn_levels=2, dropout=0.1):
+                 n_heads=8, tcn_levels=2, dropout=0.1, n_layers=1):
         super().__init__()
         self.mode = intra_mode
         if intra_mode == "none":
@@ -148,7 +121,8 @@ class IntraPatchBlock(nn.Module):
         enc = nn.TransformerEncoderLayer(
             d_model=d_model, nhead=n_heads, dim_feedforward=d_model * 2,
             dropout=dropout, activation="gelu", batch_first=True, norm_first=True)
-        self.sa = nn.TransformerEncoder(enc, num_layers=1, enable_nested_tensor=False)
+        # số tầng self-attention trong patch (chỉ áp dụng cho "attn"/"tcn_attn")
+        self.sa = nn.TransformerEncoder(enc, num_layers=n_layers, enable_nested_tensor=False)
         if intra_mode == "attn":
             self.embed = nn.Linear(in_ch, d_model)          # trộn kênh nếu in_ch=C
         elif intra_mode == "tcn_attn":
@@ -350,6 +324,7 @@ class PatchTST_IntraTCN(nn.Module):
                  n_queries=4,              # số query mỗi patch cho khối tầm xa
                  tcn_levels=2, dropout=0.1,
                  inter_layers=None,        # số lớp inter-patch; None -> dùng n_layers
+                 intra_layers=1,           # số tầng self-attention của intra (mặc định 1 như cũ)
                  inter_mode="attn",        # HƯỚNG 3: "attn" (gốc) | "mixer" (token-mixing)
                  inter_channel_mix=False,  # chỉ dùng khi inter_mode="mixer"
                  inter_token_hidden=None,  # hidden cho token-MLP (None -> 2*P)
@@ -358,6 +333,10 @@ class PatchTST_IntraTCN(nn.Module):
                  branch_norm=False,        # FIX 6: LayerNorm mỗi nhánh trước khi cộng
                  use_future=False, **kwargs):
         super().__init__()
+        if kwargs:   # in ra (không dùng warnings vì notebook đang tắt warnings)
+            print(f"[CẢNH BÁO] PatchTST_IntraTCN bỏ qua tham số không dùng: {sorted(kwargs)}")
+        if intra_layers != 1 and intra_mode not in ("attn", "tcn_attn"):
+            print(f"[CẢNH BÁO] intra_layers={intra_layers} không có tác dụng với intra_mode='{intra_mode}'")
         self.input_size = input_size
         self.context_len = context_len
         self.horizon = horizon
@@ -386,7 +365,8 @@ class PatchTST_IntraTCN(nn.Module):
         self.stats_proj = nn.Linear(2 * input_size, d_model) if stats_token else None
         self.intra = IntraPatchBlock(d_model, patch_len, intra_mode=intra_mode,
                                      in_ch=block_in_ch, n_heads=n_heads,
-                                     tcn_levels=tcn_levels, dropout=dropout)
+                                     tcn_levels=tcn_levels, dropout=dropout,
+                                     n_layers=intra_layers)
         _inter_L = inter_layers if inter_layers is not None else n_layers
         if inter_mode == "attn":
             self.inter = InterPatchBlock(d_model, patch_len, P, in_ch=block_in_ch,
